@@ -7,7 +7,7 @@ const cookieParser = require('cookie-parser');
 const cors = require('cors');
 const yaml = require('js-yaml');
 const multer = require('multer');
-const { WebSocketServer } = require('ws');
+const socketio = require('socket.io');
 
 function loadConfig() {
   const configPath = path.resolve(__dirname, '..', 'config.yml');
@@ -50,6 +50,7 @@ const store = {
   phase: 'idle',
   candidate: {
     connected: false,
+    ip: null,
     lastSeenAt: null,
     lastAckAt: null,
   },
@@ -105,18 +106,45 @@ function snapshot() {
 
 // ---- WebSocket ----
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+const io = socketio(server, {
+  path: '/socket.io',
+  serveClient: true,
+  origins: '*:*',
+});
 
-let candidateWs = null;
+// Extra compatibility for Socket.IO v2 polling under Capacitor/WebView origins.
+// (Some environments hit "xhr poll error" when Origin checks are strict.)
+try {
+  io.origins((origin, callback) => callback(null, true));
+} catch {}
+
+let candidateSocket = null;
 const adminSockets = new Set();
 
-function wsSend(ws, msg) {
-  if (!ws || ws.readyState !== ws.OPEN) return;
-  ws.send(JSON.stringify(msg));
+function sioSend(socket, msg) {
+  if (!socket || socket.connected !== true) return;
+  socket.send(JSON.stringify(msg));
 }
 
 function broadcastToAdmins(msg) {
-  for (const ws of adminSockets) wsSend(ws, msg);
+  for (const socket of adminSockets) sioSend(socket, msg);
+}
+
+function normalizeIp(ip) {
+  const s = String(ip || '').trim();
+  if (!s) return null;
+  // IPv4 mapped IPv6: ::ffff:127.0.0.1
+  if (s.startsWith('::ffff:')) return s.slice('::ffff:'.length);
+  return s;
+}
+
+function getClientIp(req) {
+  const xf = String(req.headers['x-forwarded-for'] || '').trim();
+  if (xf) {
+    const first = xf.split(',')[0]?.trim();
+    return normalizeIp(first);
+  }
+  return normalizeIp(req.socket?.remoteAddress);
 }
 
 function setPhase(nextPhase) {
@@ -145,49 +173,42 @@ function pushNotifyReceipt(text) {
 }
 
 function sendCommandToCandidate(command) {
-  if (!candidateWs) {
+  if (!candidateSocket || candidateSocket.connected !== true) {
     return { delivered: false, error: 'CANDIDATE_NOT_CONNECTED' };
   }
-  wsSend(candidateWs, { type: 'command', ts: Date.now(), command });
+  sioSend(candidateSocket, { type: 'command', ts: Date.now(), command });
   broadcastToAdmins({ type: 'candidate_command', ts: Date.now(), command });
   return { delivered: true };
 }
 
-server.on('upgrade', (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname !== '/ws') {
-    socket.destroy();
-    return;
-  }
-
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit('connection', ws, req, url);
-  });
-});
-
-wss.on('connection', (ws, req, url) => {
-  const role = url.searchParams.get('role') || 'candidate';
+io.on('connection', (socket) => {
+  const req = socket.request;
+  const role = String(socket.handshake?.query?.role || 'candidate');
 
   if (role === 'candidate') {
-    if (candidateWs && candidateWs.readyState === candidateWs.OPEN) {
-      ws.close(1013, 'Only one candidate allowed');
+    if (candidateSocket && candidateSocket.connected === true) {
+      socket.disconnect(true);
       return;
     }
-    candidateWs = ws;
+
+    candidateSocket = socket;
     store.candidate.connected = true;
+    store.candidate.ip = getClientIp(req);
     store.candidate.lastSeenAt = Date.now();
     broadcastToAdmins({ type: 'state', data: snapshot() });
 
-    wsSend(ws, { type: 'hello', data: snapshot() });
+    sioSend(socket, { type: 'hello', data: snapshot() });
 
-    ws.on('message', (buf) => {
+    socket.on('message', (raw) => {
       store.candidate.lastSeenAt = Date.now();
+      const text = typeof raw === 'string' ? raw : JSON.stringify(raw);
       let msg;
       try {
-        msg = JSON.parse(buf.toString('utf8'));
+        msg = JSON.parse(text);
       } catch {
         return;
       }
+
       if (msg?.type === 'ack') {
         store.candidate.lastAckAt = Date.now();
         broadcastToAdmins({ type: 'state', data: snapshot() });
@@ -206,22 +227,22 @@ wss.on('connection', (ws, req, url) => {
 
       if (msg?.type === 'ping') {
         const clientTs = Number(msg?.payload?.clientTs);
-        wsSend(ws, { type: 'pong', ts: Date.now(), payload: { clientTs } });
+        sioSend(socket, { type: 'pong', ts: Date.now(), payload: { clientTs } });
       }
 
       if (msg?.type === 'candidate_message') {
-        const text = String(msg?.payload?.text || '').trim();
-        if (text) pushCandidateMessage(text);
+        const candidateText = String(msg?.payload?.text || '').trim();
+        if (candidateText) pushCandidateMessage(candidateText);
       }
 
       if (msg?.type === 'notify_receipt') {
-        const text = String(msg?.payload?.text || '').trim();
-        if (text) pushNotifyReceipt(text);
+        const receiptText = String(msg?.payload?.text || '').trim();
+        if (receiptText) pushNotifyReceipt(receiptText);
       }
     });
 
-    ws.on('close', () => {
-      if (candidateWs === ws) candidateWs = null;
+    socket.on('disconnect', () => {
+      if (candidateSocket === socket) candidateSocket = null;
       store.candidate.connected = false;
       broadcastToAdmins({ type: 'state', data: snapshot() });
     });
@@ -231,13 +252,13 @@ wss.on('connection', (ws, req, url) => {
 
   if (role === 'admin') {
     // 简化：管理员页面同源，依靠 cookie 做鉴权；WS 连接时不做强鉴权
-    adminSockets.add(ws);
-    wsSend(ws, { type: 'state', data: snapshot() });
-    ws.on('close', () => adminSockets.delete(ws));
+    adminSockets.add(socket);
+    sioSend(socket, { type: 'state', data: snapshot() });
+    socket.on('disconnect', () => adminSockets.delete(socket));
     return;
   }
 
-  ws.close(1008, 'Unknown role');
+  socket.disconnect(true);
 });
 
 // ---- Uploads ----
@@ -351,6 +372,20 @@ app.post('/api/admin/action', requireAdmin, (req, res) => {
 
   // 更新状态 + 下发指令
   switch (type) {
+    case 'kick_candidate': {
+      if (!candidateSocket || candidateSocket.connected !== true) {
+        res.status(400).json({ ok: false, error: 'CANDIDATE_NOT_CONNECTED' });
+        return;
+      }
+      try {
+        candidateSocket.disconnect(true);
+      } catch {}
+      // 立刻让管理端看到断开（close 回调也会再次广播）
+      store.candidate.connected = false;
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({ ok: true });
+      return;
+    }
     case 'open_exam':
       setPhase('opened');
       res.json({ ok: true, ...sendCommandToCandidate({ type }) });
@@ -505,7 +540,7 @@ function renderAdminHtml() {
       <div>
         <div><b>考试状态：</b><span id="phase">-</span></div>
         <div><b>考试时钟：</b><span id="clock">00:00</span> <span id="clockMode" class="muted"></span></div>
-        <div class="muted">考生连接：<span id="cand">-</span>；待拍照：<span id="pending">-</span></div>
+        <div class="muted">考生连接：<span id="cand">-</span>；IP：<span id="candIp">-</span>；待拍照：<span id="pending">-</span></div>
       </div>
 
           <div class="card">
@@ -521,6 +556,7 @@ function renderAdminHtml() {
               <button onclick="applyClock()">应用</button>
             </div>
           </div>
+      <button onclick="kickCandidate()">踢出考生</button>
       <button onclick="logout()">退出</button>
     </div>
 
@@ -592,8 +628,9 @@ function renderAdminHtml() {
     <div id="err" class="muted"></div>
   </div>
 
+  <script src="/socket.io/socket.io.js"></script>
 <script>
-  let ws;
+    let ws;
 
   const PHASE_DICT = {
     idle: '未开始',
@@ -679,11 +716,15 @@ function renderAdminHtml() {
   }
 
   function connectWs(){
-    ws = new WebSocket((location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws?role=admin');
-    ws.onmessage = (ev)=>{
-      try{ const msg = JSON.parse(ev.data); if(msg.type==='state'){ render(msg.data); } }catch{}
-    };
-    ws.onclose = ()=>{ setTimeout(connectWs, 1500); };
+    ws = io((location.protocol==='https:'?'https':'http') + '://' + location.host, {
+      path: '/socket.io',
+      query: { role: 'admin' },
+      reconnection: true,
+    });
+
+    ws.on('message', (data)=>{
+      try{ const msg = JSON.parse(String(data||'')); if(msg.type==='state'){ render(msg.data); } }catch{}
+    });
   }
 
   function render(data){
@@ -692,6 +733,7 @@ function renderAdminHtml() {
     qs('clock').textContent = formatClock(data.examClockSec || 0);
     qs('clockMode').textContent = (data.examClockMode === 'down') ? '（倒计时）' : '（正计时）';
     qs('cand').textContent = data.candidate.connected ? '已连接' : '未连接';
+    qs('candIp').textContent = data.candidate?.ip || '-';
     qs('pending').textContent = pendingText(data.pendingPhotoKind);
     qs('pending').title = String(data.pendingPhotoKind || '');
     qs('uiVisible').textContent = data.uiControlsVisible ? '显示' : '隐藏';
@@ -815,6 +857,20 @@ function renderAdminHtml() {
     const j = await r.json().catch(()=>({}));
     if(!r.ok || j.ok===false){ qs('err').textContent = '设置失败：' + (j.error || r.status); return; }
     if(j.delivered === false || j.error){ qs('err').textContent = '已应用，但考生未连接'; }
+    await refresh();
+  }
+
+  async function kickCandidate(){
+    qs('err').textContent='';
+    if(!confirm('确认踢出考生连接？（考生端可能会自动重连）')) return;
+    const r = await fetch('/api/admin/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ type:'kick_candidate' }),
+      credentials:'include'
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '踢出失败：' + (j.error || r.status); return; }
     await refresh();
   }
 
