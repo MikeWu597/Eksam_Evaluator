@@ -1,0 +1,8 @@
+# 考试服务端配置
+# 修改 adminPassword 为你自己的密码
+port: 3000
+adminPassword: "change-me"
+# 上传文件保存位置（相对本项目根目录）
+uploadDir: "./data/uploads"
+# 会话密钥（可留空，服务端启动时会自动生成随机值；重启会导致需要重新登录）
+sessionSecret: ""
