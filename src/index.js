@@ -53,12 +53,17 @@ const store = {
     lastSeenAt: null,
     lastAckAt: null,
   },
+  examClockSec: 0,
+  examClockMode: 'up', // 'up' | 'down'
+  examClockUpdatedAt: null,
+  uiControlsVisible: true,
   pendingPhotoKind: null, // 'paper_check' | 'collect_paper' | null
   photos: {
     paper_check: [],
     collect_paper: [],
   },
   notifications: [],
+  candidateMessages: [],
 };
 
 const sessions = new Map(); // token -> createdAt
@@ -79,9 +84,14 @@ function snapshot() {
   return {
     phase: store.phase,
     candidate: store.candidate,
+    examClockSec: store.examClockSec,
+    examClockMode: store.examClockMode,
+    examClockUpdatedAt: store.examClockUpdatedAt,
+    uiControlsVisible: store.uiControlsVisible,
     pendingPhotoKind: store.pendingPhotoKind,
     photos: store.photos,
     notifications: store.notifications.slice(-20),
+    candidateMessages: store.candidateMessages.slice(-20),
   };
 }
 
@@ -113,6 +123,11 @@ function setPendingPhoto(kindOrNull) {
 
 function pushNotification(text) {
   store.notifications.push({ ts: Date.now(), text: String(text || '') });
+  broadcastToAdmins({ type: 'state', data: snapshot() });
+}
+
+function pushCandidateMessage(text) {
+  store.candidateMessages.push({ ts: Date.now(), text: String(text || '') });
   broadcastToAdmins({ type: 'state', data: snapshot() });
 }
 
@@ -163,6 +178,27 @@ wss.on('connection', (ws, req, url) => {
       if (msg?.type === 'ack') {
         store.candidate.lastAckAt = Date.now();
         broadcastToAdmins({ type: 'state', data: snapshot() });
+      }
+
+      if (msg?.type === 'timer_sync') {
+        const mode = msg?.payload?.mode === 'down' ? 'down' : 'up';
+        const sec = Number(msg?.payload?.valueSec);
+        if (Number.isFinite(sec) && sec >= 0 && sec < 24 * 60 * 60) {
+          store.examClockMode = mode;
+          store.examClockSec = Math.floor(sec);
+          store.examClockUpdatedAt = Date.now();
+          broadcastToAdmins({ type: 'state', data: snapshot() });
+        }
+      }
+
+      if (msg?.type === 'ping') {
+        const clientTs = Number(msg?.payload?.clientTs);
+        wsSend(ws, { type: 'pong', ts: Date.now(), payload: { clientTs } });
+      }
+
+      if (msg?.type === 'candidate_message') {
+        const text = String(msg?.payload?.text || '').trim();
+        if (text) pushCandidateMessage(text);
       }
     });
 
@@ -279,8 +315,41 @@ app.post('/api/admin/action', requireAdmin, (req, res) => {
       return;
     case 'start_exam':
       setPhase('in_progress');
-      res.json({ ok: true, ...sendCommandToCandidate({ type }) });
+      // 开考不重置时钟；沿用手动设置的时间与正/倒计时模式
+      store.examClockUpdatedAt = Date.now();
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({
+        ok: true,
+        ...sendCommandToCandidate({
+          type,
+          payload: {
+            mode: store.examClockMode,
+            sec: store.examClockSec,
+          },
+        }),
+      });
       return;
+    case 'clock_set': {
+      const mode = payload?.mode === 'down' ? 'down' : 'up';
+      const sec = Number(payload?.sec);
+      if (!Number.isFinite(sec) || sec < 0 || sec >= 24 * 60 * 60) {
+        res.status(400).json({ ok: false, error: 'INVALID_SECONDS' });
+        return;
+      }
+      store.examClockMode = mode;
+      store.examClockSec = Math.floor(sec);
+      store.examClockUpdatedAt = Date.now();
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'clock_set', payload: { mode, sec: Math.floor(sec) } }) });
+      return;
+    }
+    case 'ui_controls': {
+      const visible = payload?.visible !== false;
+      store.uiControlsVisible = Boolean(visible);
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'ui_controls', payload: { visible: store.uiControlsVisible } }) });
+      return;
+    }
     case 'notify': {
       const text = String(payload?.text || '');
       pushNotification(text);
@@ -298,6 +367,10 @@ app.post('/api/admin/action', requireAdmin, (req, res) => {
       return;
     case 'close_exam':
       setPhase('closed');
+      store.examClockSec = 0;
+      store.examClockMode = 'up';
+      store.examClockUpdatedAt = Date.now();
+      store.uiControlsVisible = true;
       res.json({ ok: true, ...sendCommandToCandidate({ type }) });
       return;
     default:
@@ -348,8 +421,24 @@ function renderAdminHtml() {
     <div class="row" style="align-items:center; justify-content: space-between;">
       <div>
         <div><b>考试状态：</b><span id="phase">-</span></div>
+        <div><b>考试时钟：</b><span id="clock">00:00</span> <span id="clockMode" class="muted"></span></div>
         <div class="muted">考生连接：<span id="cand">-</span>；待拍照：<span id="pending">-</span></div>
       </div>
+
+          <div class="card">
+            <div><b>手动调整考试时钟</b></div>
+            <div class="row" style="align-items:center; margin-top: 8px;">
+              <input id="clockMm" placeholder="mm" inputmode="numeric" style="width: 72px" />
+              <span class="muted">:</span>
+              <input id="clockSs" placeholder="ss" inputmode="numeric" style="width: 72px" />
+              <select id="clockModeSel" style="padding: 8px 10px;">
+                <option value="up">正计时</option>
+                <option value="down">倒计时</option>
+              </select>
+              <button onclick="applyClock()">应用</button>
+            </div>
+            <div class="muted" style="margin-top: 6px;">应用后会下发到考生端，并由考生端每 10 秒同步回显。</div>
+          </div>
       <button onclick="logout()">退出</button>
     </div>
 
@@ -358,15 +447,30 @@ function renderAdminHtml() {
       <button onclick="action('open_exam')">开启考试</button>
       <button onclick="action('paper_check')">试卷检查(拍照)</button>
       <button onclick="action('start_exam')">开考</button>
-      <button onclick="notifyPrompt()">考试中通知</button>
+      <input id="notifyText" placeholder="考试中通知内容" style="min-width: 260px" />
+      <button onclick="sendNotify()">发送通知</button>
       <button onclick="action('end_exam')">下考</button>
       <button onclick="action('collect_paper')">收卷(拍照)</button>
       <button onclick="action('close_exam')">关闭考试</button>
     </div>
 
     <div class="card">
+      <div><b>考生端控件显示</b></div>
+      <div class="row" style="align-items:center; margin-top: 8px;">
+        <button onclick="setUiControls(true)">显示控件</button>
+        <button onclick="setUiControls(false)">隐藏控件</button>
+        <span class="muted">当前：<span id="uiVisible">-</span></span>
+      </div>
+    </div>
+
+    <div class="card">
       <div><b>通知</b></div>
       <ul id="notifs"></ul>
+    </div>
+
+    <div class="card">
+      <div><b>考生消息</b></div>
+      <ul id="candMsgs"></ul>
     </div>
 
     <div class="card">
@@ -428,6 +532,18 @@ function renderAdminHtml() {
     await refresh();
   }
 
+  async function sendNotify(){
+    qs('err').textContent='';
+    const text = (qs('notifyText')?.value || '').trim();
+    if(!text){ qs('err').textContent='请输入通知内容'; return; }
+    const r = await fetch('/api/admin/action', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({type:'notify', payload:{text}}), credentials:'include' });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '通知失败：' + (j.error || r.status); return; }
+    if(j.delivered === false || j.error){ qs('err').textContent = '已发送，但考生未连接'; }
+    qs('notifyText').value = '';
+    await refresh();
+  }
+
   function connectWs(){
     ws = new WebSocket((location.protocol==='https:'?'wss':'ws') + '://' + location.host + '/ws?role=admin');
     ws.onmessage = (ev)=>{
@@ -438,8 +554,11 @@ function renderAdminHtml() {
 
   function render(data){
     qs('phase').textContent = data.phase;
+    qs('clock').textContent = formatClock(data.examClockSec || 0);
+    qs('clockMode').textContent = (data.examClockMode === 'down') ? '（倒计时）' : '（正计时）';
     qs('cand').textContent = data.candidate.connected ? '已连接' : '未连接';
     qs('pending').textContent = data.pendingPhotoKind || '-';
+    qs('uiVisible').textContent = data.uiControlsVisible ? '显示' : '隐藏';
 
     const ul = qs('notifs');
     ul.innerHTML = '';
@@ -447,6 +566,14 @@ function renderAdminHtml() {
       const li = document.createElement('li');
       li.textContent = new Date(n.ts).toLocaleString() + ' - ' + n.text;
       ul.appendChild(li);
+    }
+
+    const cm = qs('candMsgs');
+    cm.innerHTML = '';
+    for(const n of (data.candidateMessages||[]).slice().reverse()){
+      const li = document.createElement('li');
+      li.textContent = new Date(n.ts).toLocaleString() + ' - ' + n.text;
+      cm.appendChild(li);
     }
 
     const c1 = qs('photos_check');
@@ -466,6 +593,48 @@ function renderAdminHtml() {
       a.appendChild(img);
       c2.appendChild(a);
     }
+  }
+
+  async function setUiControls(visible){
+    qs('err').textContent='';
+    const r = await fetch('/api/admin/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ type:'ui_controls', payload:{ visible } }),
+      credentials:'include'
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '设置失败：' + (j.error || r.status); return; }
+    if(j.delivered === false || j.error){ qs('err').textContent = '已设置，但考生未连接'; }
+    await refresh();
+  }
+
+  async function applyClock(){
+    qs('err').textContent='';
+    const mode = qs('clockModeSel')?.value === 'down' ? 'down' : 'up';
+    const mm = parseInt((qs('clockMm')?.value || '0').trim(), 10);
+    const ss = parseInt((qs('clockSs')?.value || '0').trim(), 10);
+    if(!Number.isFinite(mm) || mm < 0 || mm > 999){ qs('err').textContent='mm 必须是 0-999'; return; }
+    if(!Number.isFinite(ss) || ss < 0 || ss >= 60){ qs('err').textContent='ss 必须是 0-59'; return; }
+    const sec = (mm * 60) + ss;
+
+    const r = await fetch('/api/admin/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ type:'clock_set', payload:{ mode, sec } }),
+      credentials:'include'
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '设置失败：' + (j.error || r.status); return; }
+    if(j.delivered === false || j.error){ qs('err').textContent = '已应用，但考生未连接'; }
+    await refresh();
+  }
+
+  function formatClock(sec){
+    sec = Math.max(0, Math.floor(sec || 0));
+    const mm = String(Math.floor(sec / 60)).padStart(2,'0');
+    const ss = String(sec % 60).padStart(2,'0');
+    return mm + ':' + ss;
   }
 </script>
 </body>

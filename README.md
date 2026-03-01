@@ -12,6 +12,12 @@ npm run dev
 - 管理员控制台：`http://localhost:3000/admin`
 - 管理员密码在 `config.yml` 的 `adminPassword`
 
+## 考试时钟（与考生端同步）
+
+- 点击“开考”后，考生端开始自主计时。
+- 考生端每 10 秒通过 WebSocket 上报一次 `elapsedSec`。
+- 管理员控制台会显示最新同步到的“考试时钟”。
+
 ## 对接客户端
 
 客户端通过 WebSocket 连接：
