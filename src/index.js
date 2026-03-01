@@ -65,6 +65,11 @@ const store = {
   notifications: [],
   candidateMessages: [],
   notifyReceipts: [],
+  listening: {
+    active: false,
+    audioUrl: null,
+    updatedAt: null,
+  },
 };
 
 const sessions = new Map(); // token -> createdAt
@@ -94,6 +99,7 @@ function snapshot() {
     notifications: store.notifications.slice(-20),
     candidateMessages: store.candidateMessages.slice(-20),
     notifyReceipts: store.notifyReceipts.slice(-20),
+    listening: store.listening,
   };
 }
 
@@ -264,6 +270,23 @@ const upload = multer({
   },
 });
 
+const adminAudioUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dest = path.join(uploadDirAbs, 'listening');
+      ensureDir(dest);
+      cb(null, dest);
+    },
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').slice(0, 10) || '.mp3';
+      cb(null, `${Date.now()}_${randomToken().slice(0, 6)}${ext}`);
+    },
+  }),
+  limits: {
+    fileSize: 50 * 1024 * 1024,
+  },
+});
+
 app.post('/api/candidate/photo', upload.single('photo'), (req, res) => {
   const kind = String(req.body.kind || '');
   if (!['paper_check', 'collect_paper'].includes(kind)) {
@@ -280,6 +303,18 @@ app.post('/api/candidate/photo', upload.single('photo'), (req, res) => {
   if (store.pendingPhotoKind === kind) setPendingPhoto(null);
 
   broadcastToAdmins({ type: 'photo', kind, url, ts: Date.now() });
+  res.json({ ok: true, url });
+});
+
+app.post('/api/admin/listening/upload', requireAdmin, adminAudioUpload.single('audio'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ ok: false, error: 'MISSING_FILE' });
+  }
+  const relPath = path.relative(uploadDirAbs, req.file.path).split(path.sep).join('/');
+  const url = `/uploads/${relPath}`;
+  store.listening.audioUrl = url;
+  store.listening.updatedAt = Date.now();
+  broadcastToAdmins({ type: 'state', data: snapshot() });
   res.json({ ok: true, url });
 });
 
@@ -362,6 +397,40 @@ app.post('/api/admin/action', requireAdmin, (req, res) => {
       res.json({ ok: true, ...sendCommandToCandidate({ type: 'ui_controls', payload: { visible: store.uiControlsVisible } }) });
       return;
     }
+    case 'listening_open': {
+      const audioUrl = String(payload?.audioUrl || '').trim();
+      if (!audioUrl.startsWith('/')) {
+        res.status(400).json({ ok: false, error: 'INVALID_AUDIO_URL' });
+        return;
+      }
+      store.listening.active = true;
+      store.listening.audioUrl = audioUrl;
+      store.listening.updatedAt = Date.now();
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'listening_open', payload: { audioUrl } }) });
+      return;
+    }
+    case 'listening_play':
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'listening_play' }) });
+      return;
+    case 'listening_pause':
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'listening_pause' }) });
+      return;
+    case 'listening_seek': {
+      const percent = Number(payload?.percent);
+      if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
+        res.status(400).json({ ok: false, error: 'INVALID_PERCENT' });
+        return;
+      }
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'listening_seek', payload: { percent } }) });
+      return;
+    }
+    case 'listening_close':
+      store.listening.active = false;
+      store.listening.updatedAt = Date.now();
+      broadcastToAdmins({ type: 'state', data: snapshot() });
+      res.json({ ok: true, ...sendCommandToCandidate({ type: 'listening_close' }) });
+      return;
     case 'notify': {
       const text = String(payload?.text || '');
       pushNotification(text);
@@ -383,6 +452,8 @@ app.post('/api/admin/action', requireAdmin, (req, res) => {
       store.examClockMode = 'up';
       store.examClockUpdatedAt = Date.now();
       store.uiControlsVisible = true;
+      store.listening.active = false;
+      store.listening.updatedAt = Date.now();
       res.json({ ok: true, ...sendCommandToCandidate({ type }) });
       return;
     default:
@@ -449,7 +520,6 @@ function renderAdminHtml() {
               </select>
               <button onclick="applyClock()">应用</button>
             </div>
-            <div class="muted" style="margin-top: 6px;">应用后会下发到考生端，并由考生端每 10 秒同步回显。</div>
           </div>
       <button onclick="logout()">退出</button>
     </div>
@@ -472,6 +542,25 @@ function renderAdminHtml() {
         <button onclick="setUiControls(true)">显示控件</button>
         <button onclick="setUiControls(false)">隐藏控件</button>
         <span class="muted">当前：<span id="uiVisible">-</span></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div><b>听力播放</b></div>
+      <div class="row" style="align-items:center; margin-top: 8px;">
+        <input id="audioFile" type="file" accept="audio/*" />
+        <button onclick="uploadAudio()">上传音频</button>
+        <span class="muted">当前：<span id="audioUrl">-</span></span>
+      </div>
+      <div class="row" style="align-items:center; margin-top: 8px;">
+        <button onclick="openListening()">开启听力</button>
+        <button onclick="action('listening_play')">播放</button>
+        <button onclick="action('listening_pause')">暂停</button>
+        <span class="muted">进度</span>
+        <input id="seek" type="range" min="0" max="100" value="0" />
+        <button onclick="seekListening()">应用进度</button>
+        <button onclick="action('listening_close')">关闭听力</button>
+        <span class="muted">状态：<span id="listeningState">-</span></span>
       </div>
     </div>
 
@@ -505,6 +594,34 @@ function renderAdminHtml() {
 
 <script>
   let ws;
+
+  const PHASE_DICT = {
+    idle: '未开始',
+    open: '已开启',
+    opened: '已开启',
+    paper_check: '试卷检查',
+    running: '考试中',
+    in_progress: '考试中',
+    ended: '已下考',
+    collect_paper: '收卷拍照',
+    collecting: '收卷拍照',
+    closed: '已关闭',
+  };
+
+  const PHOTO_KIND_DICT = {
+    paper_check: '试卷检查',
+    collect_paper: '收卷',
+  };
+
+  function phaseText(phase){
+    const p = String(phase || '').trim();
+    return PHASE_DICT[p] || p || '-';
+  }
+
+  function pendingText(kind){
+    const k = String(kind || '').trim();
+    return PHOTO_KIND_DICT[k] || (k || '-');
+  }
 
   function qs(id){ return document.getElementById(id); }
 
@@ -570,12 +687,16 @@ function renderAdminHtml() {
   }
 
   function render(data){
-    qs('phase').textContent = data.phase;
+    qs('phase').textContent = phaseText(data.phase);
+    qs('phase').title = String(data.phase || '');
     qs('clock').textContent = formatClock(data.examClockSec || 0);
     qs('clockMode').textContent = (data.examClockMode === 'down') ? '（倒计时）' : '（正计时）';
     qs('cand').textContent = data.candidate.connected ? '已连接' : '未连接';
-    qs('pending').textContent = data.pendingPhotoKind || '-';
+    qs('pending').textContent = pendingText(data.pendingPhotoKind);
+    qs('pending').title = String(data.pendingPhotoKind || '');
     qs('uiVisible').textContent = data.uiControlsVisible ? '显示' : '隐藏';
+    qs('audioUrl').textContent = data.listening?.audioUrl || '-';
+    qs('listeningState').textContent = data.listening?.active ? '已开启' : '未开启';
 
     const ul = qs('notifs');
     ul.innerHTML = '';
@@ -632,6 +753,48 @@ function renderAdminHtml() {
     if(!r.ok || j.ok===false){ qs('err').textContent = '设置失败：' + (j.error || r.status); return; }
     if(j.delivered === false || j.error){ qs('err').textContent = '已设置，但考生未连接'; }
     await refresh();
+  }
+
+  async function uploadAudio(){
+    qs('err').textContent='';
+    const f = qs('audioFile')?.files?.[0];
+    if(!f){ qs('err').textContent='请选择音频文件'; return; }
+    const fd = new FormData();
+    fd.append('audio', f);
+    const r = await fetch('/api/admin/listening/upload', { method:'POST', body: fd, credentials:'include' });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '上传失败：' + (j.error || r.status); return; }
+    await refresh();
+  }
+
+  async function openListening(){
+    qs('err').textContent='';
+    const audioUrl = qs('audioUrl')?.textContent || '';
+    if(!audioUrl || audioUrl==='-'){ qs('err').textContent='请先上传音频'; return; }
+    const r = await fetch('/api/admin/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ type:'listening_open', payload:{ audioUrl } }),
+      credentials:'include'
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '开启失败：' + (j.error || r.status); return; }
+    if(j.delivered === false || j.error){ qs('err').textContent = '已开启，但考生未连接'; }
+    await refresh();
+  }
+
+  async function seekListening(){
+    qs('err').textContent='';
+    const percent = Number(qs('seek')?.value || 0);
+    const r = await fetch('/api/admin/action', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ type:'listening_seek', payload:{ percent } }),
+      credentials:'include'
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok || j.ok===false){ qs('err').textContent = '设置失败：' + (j.error || r.status); return; }
+    if(j.delivered === false || j.error){ qs('err').textContent = '已设置，但考生未连接'; }
   }
 
   async function applyClock(){
