@@ -64,6 +64,7 @@ const store = {
   },
   notifications: [],
   candidateMessages: [],
+  notifyReceipts: [],
 };
 
 const sessions = new Map(); // token -> createdAt
@@ -92,6 +93,7 @@ function snapshot() {
     photos: store.photos,
     notifications: store.notifications.slice(-20),
     candidateMessages: store.candidateMessages.slice(-20),
+    notifyReceipts: store.notifyReceipts.slice(-20),
   };
 }
 
@@ -128,6 +130,11 @@ function pushNotification(text) {
 
 function pushCandidateMessage(text) {
   store.candidateMessages.push({ ts: Date.now(), text: String(text || '') });
+  broadcastToAdmins({ type: 'state', data: snapshot() });
+}
+
+function pushNotifyReceipt(text) {
+  store.notifyReceipts.push({ ts: Date.now(), text: String(text || '') });
   broadcastToAdmins({ type: 'state', data: snapshot() });
 }
 
@@ -199,6 +206,11 @@ wss.on('connection', (ws, req, url) => {
       if (msg?.type === 'candidate_message') {
         const text = String(msg?.payload?.text || '').trim();
         if (text) pushCandidateMessage(text);
+      }
+
+      if (msg?.type === 'notify_receipt') {
+        const text = String(msg?.payload?.text || '').trim();
+        if (text) pushNotifyReceipt(text);
       }
     });
 
@@ -469,6 +481,11 @@ function renderAdminHtml() {
     </div>
 
     <div class="card">
+      <div><b>通知签收</b></div>
+      <ul id="notifyReceipts"></ul>
+    </div>
+
+    <div class="card">
       <div><b>考生消息</b></div>
       <ul id="candMsgs"></ul>
     </div>
@@ -566,6 +583,14 @@ function renderAdminHtml() {
       const li = document.createElement('li');
       li.textContent = new Date(n.ts).toLocaleString() + ' - ' + n.text;
       ul.appendChild(li);
+    }
+
+    const nr = qs('notifyReceipts');
+    nr.innerHTML = '';
+    for(const n of (data.notifyReceipts||[]).slice().reverse()){
+      const li = document.createElement('li');
+      li.textContent = new Date(n.ts).toLocaleString() + ' - ' + n.text;
+      nr.appendChild(li);
     }
 
     const cm = qs('candMsgs');
